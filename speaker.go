@@ -31,7 +31,7 @@ type Config struct {
 	//
 	// On Android, callers should pass:
 	//
-	//	[]malgo.Backend{malgo.BackendAaudio, malgo.BackendOpensl}
+	//      []malgo.Backend{malgo.BackendAaudio, malgo.BackendOpensl}
 	//
 	// so that AAudio is preferred (lower latency, better features) and
 	// OpenSL ES is used as a fallback on older devices.
@@ -63,6 +63,19 @@ type Speaker struct {
 	dev        *malgo.Device
 	mixer      *mixer
 	sampleRate int
+
+	// bufferSize is the configured device period size in frames. It is
+	// recorded at construction time so the package-level PlayAndWait can
+	// sleep for one buffer period after all streamers drain, allowing the
+	// device to flush any samples still in its buffer.
+	bufferSize int
+
+	// backends is the malgo backend priority list that the Speaker was
+	// constructed with. It is recorded at construction time so the
+	// package-level SetBackends can reinit with the same priority list
+	// and the Backends function can report the configured priority. The
+	// slice is owned by the Speaker; callers must not mutate it.
+	backends []malgo.Backend
 
 	// buf is a scratch buffer reused by the audio callback to mix into.
 	// It is only touched while mu is held, and the callback is serialized
@@ -107,8 +120,17 @@ func New(cfg Config) (*Speaker, error) {
 	// state if initialization fails partway through.
 	s := &Speaker{
 		sampleRate: cfg.SampleRate,
+		bufferSize: cfg.BufferSize,
 		mixer:      newMixer(volume),
 		buf:        make([][2]float64, cfg.BufferSize),
+	}
+
+	// Copy the caller's backend slice so external mutation does not
+	// affect the Speaker's recorded priority list. nil is preserved
+	// (malgo interprets nil as the platform default ordering).
+	if cfg.Backends != nil {
+		s.backends = make([]malgo.Backend, len(cfg.Backends))
+		copy(s.backends, cfg.Backends)
 	}
 
 	// Initialize the malgo context with the caller's backend priority.
@@ -300,6 +322,61 @@ func (s *Speaker) Unlock() { s.mu.Unlock() }
 // value is taken from Config.SampleRate at construction time and does not
 // change for the lifetime of the Speaker.
 func (s *Speaker) SampleRate() int { return s.sampleRate }
+
+// BufferSize returns the device period size in frames that the Speaker was
+// constructed with. The value is taken from Config.BufferSize at
+// construction time and does not change for the lifetime of the Speaker.
+func (s *Speaker) BufferSize() int { return s.bufferSize }
+
+// Backends returns the malgo backend priority list that the Speaker was
+// constructed with (a copy of Config.Backends at construction time). The
+// returned slice is a fresh copy and may be safely modified by the
+// caller.
+//
+// If Config.Backends was nil (the platform default) at construction
+// time, Backends returns nil.
+func (s *Speaker) Backends() []malgo.Backend {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.backends == nil {
+		return nil
+	}
+	out := make([]malgo.Backend, len(s.backends))
+	copy(out, s.backends)
+	return out
+}
+
+// suspend stops the playback device without uninitializing it. The
+// device can be restarted with resume. Used by the package-level
+// Suspend function; not part of the public Speaker API because it
+// overlaps semantically with the existing Pause method (which is
+// flag-based and lower-latency).
+//
+// Caller must not hold s.mu when calling suspend: Device.Stop can block
+// waiting for the worker thread, and we must not hold our mutex across
+// that. The package-level Suspend function acquires s.mu only to read
+// the closed flag and the dev pointer, then releases it before calling
+// suspend.
+func (s *Speaker) suspend() error {
+	if s.dev == nil {
+		return nil
+	}
+	if err := s.dev.Stop(); err != nil {
+		return fmt.Errorf("beepout: suspend device: %w", err)
+	}
+	return nil
+}
+
+// resume restarts the playback device after a prior suspend.
+func (s *Speaker) resume() error {
+	if s.dev == nil {
+		return nil
+	}
+	if err := s.dev.Start(); err != nil {
+		return fmt.Errorf("beepout: resume device: %w", err)
+	}
+	return nil
+}
 
 // Close stops the playback device, uninitializes it, uninitializes the
 // malgo context, and frees all associated resources.
